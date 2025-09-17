@@ -1,0 +1,49 @@
+#!/bin/bash
+# Cash Balance Tracker macOS App Launcher
+
+# Get the directory containing this script
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+RESOURCES_DIR="$DIR/../Resources"
+
+# Change to resources directory
+cd "$RESOURCES_DIR"
+
+# Find Python
+PYTHON_CMD=""
+for cmd in python3.11 python3.10 python3.9 python3.8 python3; do
+    if command -v "$cmd" &> /dev/null; then
+        # Check if this Python version has tkinter
+        if "$cmd" -c "import tkinter" 2>/dev/null; then
+            PYTHON_CMD="$cmd"
+            break
+        fi
+    fi
+done
+
+if [ -z "$PYTHON_CMD" ]; then
+    # Show error dialog using macOS native dialog
+    osascript -e 'display dialog "Python 3.8+ with tkinter is required to run Cash Balance Tracker.\n\nPlease install Python from python.org or using Homebrew:\nbrew install python3" with title "Cash Balance Tracker" buttons {"OK"} default button "OK" with icon stop'
+    exit 1
+fi
+
+# Check for required packages and install if needed
+if ! "$PYTHON_CMD" -c "import pandas" 2>/dev/null; then
+    # Ask user if they want to install dependencies
+    response=$(osascript -e 'display dialog "Cash Balance Tracker needs to install required packages (pandas, openpyxl).\n\nThis is safe and only affects this application." with title "Install Dependencies" buttons {"Cancel", "Install"} default button "Install" with icon note')
+    
+    if [[ "$response" == *"Install"* ]]; then
+        # Try to install packages
+        "$PYTHON_CMD" -m pip install --user pandas openpyxl
+        
+        # Check if installation was successful
+        if ! "$PYTHON_CMD" -c "import pandas" 2>/dev/null; then
+            osascript -e 'display dialog "Failed to install required packages. Please install manually:\n\npip3 install pandas openpyxl" with title "Installation Failed" buttons {"OK"} default button "OK" with icon stop'
+            exit 1
+        fi
+    else
+        exit 1
+    fi
+fi
+
+# Launch the application
+exec "$PYTHON_CMD" cash_balance_gui.py
