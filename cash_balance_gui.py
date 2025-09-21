@@ -23,13 +23,35 @@ from cash_balance_tracker import (
     load_excel_trade_data,
     convert_trade_data_format,
     calculate_dynamic_cash_balance, 
-    recalculate_trade_metrics
+    recalculate_trade_metrics,
+    run_benchmark_analysis
 )
+
+# Import HTML parsers
+try:
+    from parse_trading_data_html import parse_trading_data_html
+    from parse_spy_data import parse_spy_html_data
+    HTML_PARSERS_AVAILABLE = True
+except ImportError:
+    HTML_PARSERS_AVAILABLE = False
+    print("Warning: HTML parsers not available. HTML files will be disabled.")
+
+# Import visualization functions
+try:
+    from visualization import save_charts_to_files, display_charts
+    VISUALIZATION_AVAILABLE = True
+except ImportError:
+    VISUALIZATION_AVAILABLE = False
+    print("Warning: Visualization module not available. Charts will be disabled.")
 
 class CashBalanceGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Cash Balance Tracker - 10% Dynamic Position Sizing")
+        
+        # Thread management
+        self.active_threads = []
+        self.is_closing = False
         
         # Detect platform for better compatibility
         self.is_macos = platform.system() == "Darwin"
@@ -44,15 +66,21 @@ class CashBalanceGUI:
         
         # Variables
         self.file_path = tk.StringVar()
+        self.benchmark_file_path = tk.StringVar()
         self.starting_cash = tk.StringVar(value="1000000")
         self.daily_balances = None
         self.updated_trades = None
+        self.benchmark_data = None
+        self.comparison_metrics = None
         
         # Configure for macOS if needed
         if self.is_macos:
             self.setup_macos_specific()
         
         self.setup_gui()
+        
+        # Set up cleanup handlers
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
     def setup_macos_specific(self):
         """Configure macOS-specific settings"""
@@ -105,7 +133,7 @@ class CashBalanceGUI:
         self.browse_button.grid(row=0, column=2)
         
         # Supported formats info
-        formats_label = ttk.Label(file_frame, text="Supported formats: CSV (recommended), Excel (.xlsx, .xls)", 
+        formats_label = ttk.Label(file_frame, text="Supported formats: CSV (recommended), Excel (.xlsx, .xls), HTML", 
                                  font=("Arial", 9), foreground="gray")
         formats_label.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
         
@@ -114,9 +142,27 @@ class CashBalanceGUI:
                               font=("Arial", 8), foreground="orange")
         excel_note.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(2, 0))
         
+        # Benchmark analysis section
+        benchmark_frame = ttk.LabelFrame(main_frame, text="Benchmark Analysis (Optional)", padding="10")
+        benchmark_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+        benchmark_frame.columnconfigure(1, weight=1)
+        
+        ttk.Label(benchmark_frame, text="Benchmark File:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        
+        self.benchmark_entry = ttk.Entry(benchmark_frame, textvariable=self.benchmark_file_path, width=60)
+        self.benchmark_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 10))
+        
+        self.benchmark_browse_button = ttk.Button(benchmark_frame, text="Browse...", command=self.browse_benchmark_file)
+        self.benchmark_browse_button.grid(row=0, column=2)
+        
+        # Benchmark info
+        benchmark_info = ttk.Label(benchmark_frame, text="SPY/QQQ OHLC data for performance comparison (CSV format)", 
+                                  font=("Arial", 9), foreground="gray")
+        benchmark_info.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
+        
         # Settings section
         settings_frame = ttk.LabelFrame(main_frame, text="Settings", padding="10")
-        settings_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+        settings_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
         
         ttk.Label(settings_frame, text="Starting Cash ($):").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
         
@@ -125,7 +171,7 @@ class CashBalanceGUI:
         
         # Column mapping section
         mapping_frame = ttk.LabelFrame(main_frame, text="Column Mapping (Auto-detected)", padding="10")
-        mapping_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+        mapping_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
         mapping_frame.columnconfigure(1, weight=1)
         
         # Expected columns info
@@ -136,11 +182,19 @@ class CashBalanceGUI:
         
         # Action buttons
         button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=4, column=0, columnspan=3, pady=(0, 10))
+        button_frame.grid(row=5, column=0, columnspan=3, pady=(0, 10))
         
         self.analyze_button = ttk.Button(button_frame, text="Analyze Trading Data", 
                                         command=self.analyze_data, style="Accent.TButton")
         self.analyze_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.benchmark_button = ttk.Button(button_frame, text="Compare vs Benchmark", 
+                                          command=self.analyze_benchmark, state="disabled")
+        self.benchmark_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.charts_button = ttk.Button(button_frame, text="Show Charts", 
+                                       command=self.show_charts, state="disabled")
+        self.charts_button.pack(side=tk.LEFT, padx=(0, 10))
         
         self.save_button = ttk.Button(button_frame, text="Save Results", 
                                      command=self.save_results, state="disabled")
@@ -151,20 +205,20 @@ class CashBalanceGUI:
         
         # Progress bar
         self.progress = ttk.Progressbar(main_frame, mode='indeterminate')
-        self.progress.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+        self.progress.grid(row=6, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
         
         # Status label
         self.status_var = tk.StringVar(value="Ready to analyze trading data...")
         self.status_label = ttk.Label(main_frame, textvariable=self.status_var, 
                                      font=("Arial", 9), foreground="green")
-        self.status_label.grid(row=6, column=0, columnspan=3, sticky=tk.W)
+        self.status_label.grid(row=7, column=0, columnspan=3, sticky=tk.W)
         
         # Results section
         results_frame = ttk.LabelFrame(main_frame, text="Analysis Results", padding="10")
-        results_frame.grid(row=7, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(10, 0))
+        results_frame.grid(row=8, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(10, 0))
         results_frame.columnconfigure(0, weight=1)
         results_frame.rowconfigure(0, weight=1)
-        main_frame.rowconfigure(7, weight=1)
+        main_frame.rowconfigure(8, weight=1)
         
         # Results text area with scrollbar
         self.results_text = scrolledtext.ScrolledText(results_frame, height=20, width=80, 
@@ -200,9 +254,10 @@ The tool will automatically:
     def browse_file(self):
         """Open file dialog to select trading data file"""
         filetypes = [
-            ("All Supported", "*.csv *.xlsx *.xls"),
+            ("All Supported", "*.csv *.xlsx *.xls *.html"),
             ("CSV files", "*.csv"),
             ("Excel files", "*.xlsx *.xls"),
+            ("HTML files", "*.html"),
             ("All files", "*.*")
         ]
         
@@ -214,6 +269,22 @@ The tool will automatically:
         if filename:
             self.file_path.set(filename)
             self.status_var.set(f"Selected: {os.path.basename(filename)}")
+            
+    def browse_benchmark_file(self):
+        """Open file dialog to select benchmark data file"""
+        filetypes = [
+            ("CSV files", "*.csv"),
+            ("All files", "*.*")
+        ]
+        
+        filename = filedialog.askopenfilename(
+            title="Select Benchmark Data File (SPY/QQQ OHLC)",
+            filetypes=filetypes
+        )
+        
+        if filename:
+            self.benchmark_file_path.set(filename)
+            self.status_var.set(f"Selected benchmark: {os.path.basename(filename)}")
             
     def update_status(self, message, color="black"):
         """Update status message"""
@@ -247,6 +318,7 @@ The tool will automatically:
         # Run analysis in separate thread to prevent GUI freezing
         thread = threading.Thread(target=self._run_analysis, args=(starting_cash,))
         thread.daemon = True
+        self.active_threads.append(thread)
         thread.start()
         
     def _run_analysis(self, starting_cash):
@@ -269,8 +341,14 @@ The tool will automatically:
                     exit_price_col='ExitPrice',
                     ticker_col='Ticker'
                 )
+            elif file_ext == '.html':
+                if not HTML_PARSERS_AVAILABLE:
+                    raise ImportError("HTML parsers not available. Please install required packages.")
+                trades_df = parse_trading_data_html(file_path)
+                if trades_df.empty:
+                    raise ValueError("No valid trading data found in HTML file")
             else:
-                raise ValueError(f"Unsupported file format: {file_ext}. Please use CSV, .xlsx, or .xls files.")
+                raise ValueError(f"Unsupported file format: {file_ext}. Please use CSV, .xlsx, .xls, or .html files.")
                 
             self.update_status("Calculating daily cash balances...", "blue")
             
@@ -285,7 +363,8 @@ The tool will automatically:
             self.updated_trades = recalculate_trade_metrics(trades_df, self.daily_balances)
             
             # Display results on main thread
-            self.root.after(0, self._display_results, starting_cash)
+            if not self.is_closing:
+                self.root.after(0, self._display_results, starting_cash)
             
         except ImportError as e:
             if "openpyxl" in str(e).lower():
@@ -294,26 +373,55 @@ The tool will automatically:
                            "Or save your Excel file as CSV format instead.")
             else:
                 error_msg = f"Missing required library: {str(e)}"
-            self.root.after(0, self._show_error, error_msg)
+            if not self.is_closing:
+                self.root.after(0, self._show_error, error_msg)
             
         except Exception as e:
             error_msg = f"Error analyzing data: {str(e)}"
-            self.root.after(0, self._show_error, error_msg)
+            if not self.is_closing:
+                self.root.after(0, self._show_error, error_msg)
+        finally:
+            # Clean up thread reference
+            if hasattr(self, 'active_threads'):
+                current_thread = threading.current_thread()
+                if current_thread in self.active_threads:
+                    self.active_threads.remove(current_thread)
             
     def _show_error(self, error_msg):
         """Show error message on main thread"""
+        if self.is_closing:
+            return
         self.progress.stop()
         self.analyze_button.config(state="normal")
         self.update_status("Error occurred", "red")
         messagebox.showerror("Analysis Error", error_msg)
+    
+    def on_closing(self):
+        """Handle window closing event"""
+        self.is_closing = True
+        
+        # Stop all active threads
+        for thread in self.active_threads:
+            if thread.is_alive():
+                # Note: We can't forcefully stop threads, but we can mark them for cleanup
+                pass
+        
+        # Clear active threads list
+        self.active_threads.clear()
+        
+        # Destroy the window
+        self.root.destroy()
         
     def _display_results(self, starting_cash):
         """Display analysis results on main thread"""
+        if self.is_closing:
+            return
         try:
             # Stop progress and re-enable button
             self.progress.stop()
             self.analyze_button.config(state="normal")
             self.save_button.config(state="normal")
+            self.benchmark_button.config(state="normal")
             
             # Clear previous results
             self.results_text.delete(1.0, tk.END)
@@ -418,13 +526,171 @@ Location: {save_dir}"""
         except Exception as e:
             messagebox.showerror("Save Error", f"Error saving results: {str(e)}")
             
+    def analyze_benchmark(self):
+        """Run benchmark analysis comparing strategy vs SPY/QQQ"""
+        if not self.file_path.get():
+            messagebox.showerror("Error", "Please analyze trading data first.")
+            return
+            
+        if not self.benchmark_file_path.get():
+            messagebox.showerror("Error", "Please select a benchmark data file first.")
+            return
+            
+        if not os.path.exists(self.benchmark_file_path.get()):
+            messagebox.showerror("Error", "Selected benchmark file does not exist.")
+            return
+        
+        # Disable button and start progress
+        self.benchmark_button.config(state="disabled")
+        self.progress.start()
+        self.update_status("Running benchmark analysis...", "blue")
+        
+        # Run analysis in separate thread
+        thread = threading.Thread(target=self._run_benchmark_analysis)
+        thread.daemon = True
+        self.active_threads.append(thread)
+        thread.start()
+        
+    def _run_benchmark_analysis(self):
+        """Run benchmark analysis in separate thread"""
+        try:
+            starting_cash = float(self.starting_cash.get().replace(',', ''))
+            
+            # Run benchmark analysis
+            strategy_data, benchmark_data, comparison_metrics = run_benchmark_analysis(
+                self.file_path.get(), 
+                self.benchmark_file_path.get(), 
+                starting_cash
+            )
+            
+            if strategy_data is not None and benchmark_data is not None and comparison_metrics:
+                self.benchmark_data = benchmark_data
+                self.comparison_metrics = comparison_metrics
+                if not self.is_closing:
+                    self.root.after(0, self._display_benchmark_results, comparison_metrics)
+            else:
+                if not self.is_closing:
+                    self.root.after(0, self._show_error, "Failed to run benchmark analysis")
+                
+        except Exception as e:
+            error_msg = f"Error running benchmark analysis: {str(e)}"
+            if not self.is_closing:
+                self.root.after(0, self._show_error, error_msg)
+        finally:
+            # Clean up thread reference
+            if hasattr(self, 'active_threads'):
+                current_thread = threading.current_thread()
+                if current_thread in self.active_threads:
+                    self.active_threads.remove(current_thread)
+            
+    def _display_benchmark_results(self, comparison_metrics):
+        """Display benchmark comparison results on main thread"""
+        if self.is_closing:
+            return
+        try:
+            # Stop progress and re-enable button
+            self.progress.stop()
+            self.benchmark_button.config(state="normal")
+            self.charts_button.config(state="normal")
+            
+            # Clear previous results
+            self.results_text.delete(1.0, tk.END)
+            
+            # Format benchmark results
+            results = f"""=== BENCHMARK COMPARISON ANALYSIS ===
+
+FILE ANALYZED: {os.path.basename(self.file_path.get())}
+BENCHMARK: {os.path.basename(self.benchmark_file_path.get())}
+ANALYSIS DATE: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+=== PERFORMANCE COMPARISON ===
+Your Strategy Return:     {comparison_metrics['strategy_total_return']:8.2f}%
+SPY Buy & Hold Return:    {comparison_metrics['benchmark_total_return']:8.2f}%
+Alpha (Excess Return):    {comparison_metrics['alpha']:8.2f}%
+Beta (Volatility):        {comparison_metrics['beta']:8.2f}
+
+=== RISK METRICS ===
+Strategy Sharpe Ratio:    {comparison_metrics['strategy_sharpe']:8.2f}
+Benchmark Sharpe Ratio:   {comparison_metrics['benchmark_sharpe']:8.2f}
+Strategy Max Drawdown:    {comparison_metrics['strategy_max_drawdown']:8.2f}%
+Benchmark Max Drawdown:   {comparison_metrics['benchmark_max_drawdown']:8.2f}%
+
+=== PERFORMANCE BREAKDOWN ===
+Win Rate:                 {comparison_metrics['win_rate']:8.1f}%
+Outperforming Days:       {comparison_metrics['outperforming_days']:8.0f} / {comparison_metrics['total_days']:8.0f}
+
+=== FINAL VALUES ===
+Final Strategy Value:     ${comparison_metrics['final_strategy_value']:12,.2f}
+Final Benchmark Value:    ${comparison_metrics['final_benchmark_value']:12,.2f}
+
+=== INTERPRETATION ===
+"""
+            
+            # Add interpretation
+            if comparison_metrics['alpha'] > 0:
+                results += f"✅ Your strategy outperformed the benchmark by {comparison_metrics['alpha']:.2f}%\n"
+            else:
+                results += f"❌ Your strategy underperformed the benchmark by {abs(comparison_metrics['alpha']):.2f}%\n"
+                
+            if comparison_metrics['win_rate'] > 50:
+                results += f"✅ Your strategy beat the benchmark on {comparison_metrics['win_rate']:.1f}% of trading days\n"
+            else:
+                results += f"❌ Your strategy beat the benchmark on only {comparison_metrics['win_rate']:.1f}% of trading days\n"
+                
+            if comparison_metrics['strategy_sharpe'] > comparison_metrics['benchmark_sharpe']:
+                results += f"✅ Your strategy has better risk-adjusted returns (Sharpe ratio)\n"
+            else:
+                results += f"❌ Your strategy has lower risk-adjusted returns than the benchmark\n"
+                
+            if comparison_metrics['strategy_max_drawdown'] > comparison_metrics['benchmark_max_drawdown']:
+                results += f"⚠️  Your strategy had larger maximum drawdown than the benchmark\n"
+            else:
+                results += f"✅ Your strategy had smaller maximum drawdown than the benchmark\n"
+            
+            self.results_text.insert(tk.END, results)
+            self.update_status("Benchmark analysis complete!", "green")
+            
+        except Exception as e:
+            self.update_status("Error displaying results", "red")
+            messagebox.showerror("Display Error", f"Error displaying benchmark results: {str(e)}")
+            
+    def show_charts(self):
+        """Display performance charts"""
+        if not VISUALIZATION_AVAILABLE:
+            messagebox.showerror("Charts Not Available", 
+                               "Visualization module not available. Please install matplotlib and seaborn.")
+            return
+            
+        if self.daily_balances is None:
+            messagebox.showerror("Error", "Please run analysis first.")
+            return
+            
+        if self.benchmark_data is None or self.comparison_metrics is None:
+            messagebox.showerror("Error", "Please run benchmark analysis first.")
+            return
+            
+        try:
+            # Display charts
+            display_charts(self.daily_balances, self.benchmark_data, self.comparison_metrics)
+            self.update_status("Charts displayed successfully!", "green")
+            
+        except Exception as e:
+            error_msg = f"Error displaying charts: {str(e)}"
+            messagebox.showerror("Chart Error", error_msg)
+            self.update_status("Error displaying charts", "red")
+            
     def clear_results(self):
         """Clear all results and reset the interface"""
         self.file_path.set("")
+        self.benchmark_file_path.set("")
         self.starting_cash.set("1000000")
         self.daily_balances = None
         self.updated_trades = None
+        self.benchmark_data = None
+        self.comparison_metrics = None
         self.save_button.config(state="disabled")
+        self.benchmark_button.config(state="disabled")
+        self.charts_button.config(state="disabled")
         
         # Clear results text
         self.results_text.delete(1.0, tk.END)

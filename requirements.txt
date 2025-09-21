@@ -18,3 +18,17 @@ python-dateutil>=2.8.0
 
 # Alternative Excel support (for older .xls files)
 # xlrd>=2.0.0
+
+# Visualization and charting
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# HTML parsing for SPY data
+beautifulsoup4>=4.11.0
+
+# Additional dependencies
+numpy>=1.26.0
+pytz>=2020.1
+tzdata>=2022.7
+et-xmlfile
+six>=1.5
